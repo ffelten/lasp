@@ -36,6 +36,7 @@
          stream/2,
          query/1,
          update/3,
+         transaction/2,
          bind/2,
          bind_to/2,
          read/2,
@@ -63,6 +64,9 @@
 
 %% blocking sync helper.
 -export([blocking_sync/1]).
+
+%% core udpate helper
+-export([declare_if_not_found/6]).
 
 -include("lasp.hrl").
 
@@ -121,6 +125,15 @@ query(Id) ->
 -spec update(id(), operation(), actor()) -> {ok, var()} | error().
 update(Id, Operation, Actor) ->
     gen_server:call(?MODULE, {update, Id, Operation, Actor}, infinity).
+
+%% @doc Performs atomically multiple operations.
+%%
+%%      Performs the corresponding operation for each element of `Operations'.
+%%
+-spec transaction(list(), actor()) -> {ok, list()} | error().
+transaction(Operations, Actor) ->
+    gen_server:call(?MODULE, {transaction, Operations, Actor}, infinity).
+
 
 %% @doc Bind a dataflow variable to a value.
 %%
@@ -469,6 +482,30 @@ handle_call({update, Id, Operation, CRDTActor}, _From,
 
     {reply, Result, State};
 
+%% Perform a transaction, i.e. multiple operations atomically
+%%
+%% The CRDT actor is used to distinguish actors *per-thread*, if
+%% necessary, where the vclock is serialized *per-node*.
+%%
+handle_call({transaction, Operations, CRDTActor}, _From,
+        #state{store=Store, actor=Actor}=State) ->
+    lasp_marathon_simulations:log_message_queue_size("transaction"),
+
+    %% Apply all operations locally
+    Result = lists:foldl(fun(Operation, Acc) ->
+        {Id, Change} = Operation,
+        Result0 = ?CORE:update(Id, Change, CRDTActor, ?CLOCK_INCR(Actor),
+                                ?CLOCK_INIT(Actor), Store),
+        {ok, Final} = declare_if_not_found(Result0, Id, State, ?CORE, update,
+                             [Id, Operation, Actor, ?CLOCK_INCR(Actor), Store]),
+        [Final | Acc]
+    end, [],Operations),
+
+    lasp_state_based_synchronization_backend:buffer_updates(Operations, CRDTActor, erlang:unique_integer()),
+
+    %% Return the list of updated objects
+    {reply, {ok, Result} , State};
+
 handle_call({enforce_once, Id, Threshold, EnforceFun},
             _From,
             #state{store=Store}=State) ->
@@ -584,6 +621,14 @@ terminate(_Reason, _State) ->
 code_change(_OldVsn, State, _Extra) ->
     {ok, State}.
 
+declare_if_not_found({error, not_found}, {StorageId, TypeId},
+                     #state{store=Store, actor=Actor}, Module, Function, Args) ->
+    {ok, {{StorageId, TypeId}, _, _, _}} = ?CORE:declare(StorageId, TypeId,
+                                                         ?CLOCK_INIT(Actor), Store),
+    erlang:apply(Module, Function, Args);
+declare_if_not_found(Result, _Id, _State, _Module, _Function, _Args) ->
+    Result.
+
 %%%===================================================================
 %%% Internal functions
 %%%===================================================================
@@ -618,15 +663,6 @@ get(Id, Store) ->
     end,
     Threshold = undefined,
     ?CORE:read(Id, Threshold, Store, self(), ReplyFun, BlockingFun).
-
-%% @private
-declare_if_not_found({error, not_found}, {StorageId, TypeId},
-                     #state{store=Store, actor=Actor}, Module, Function, Args) ->
-    {ok, {{StorageId, TypeId}, _, _, _}} = ?CORE:declare(StorageId, TypeId,
-                                                         ?CLOCK_INIT(Actor), Store),
-    erlang:apply(Module, Function, Args);
-declare_if_not_found(Result, _Id, _State, _Module, _Function, _Args) ->
-    Result.
 
 %% @private
 blocking_sync(Id, Metadata) ->

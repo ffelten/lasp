@@ -32,6 +32,7 @@
          peer_to_peer_mode/0,
          i_am_server/0,
          i_am_client/0,
+         should_sync/1,
          reactive_server/0,
          seed/0,
          membership/0,
@@ -126,6 +127,10 @@ i_am_server() ->
 %% @private
 i_am_client() ->
     partisan_config:get(tag, undefined) == client.
+
+%% @private
+should_sync(Bool) ->
+    lasp_config:get(sync, Bool).
 
 %% @private
 reactive_server() ->

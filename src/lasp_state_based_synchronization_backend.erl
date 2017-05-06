@@ -35,7 +35,8 @@
          terminate/2,
          code_change/3]).
 
--export([blocking_sync/1]).
+-export([blocking_sync/1,
+         buffer_updates/3]).
 
 %% lasp_synchronization_backend callbacks
 -export([extract_log_type_and_payload/1]).
@@ -46,7 +47,10 @@
 -record(state, {store :: store(),
                 gossip_peers :: [],
                 actor :: binary(),
-                blocking_syncs :: dict:dict()}).
+                blocking_syncs :: dict:dict(),
+                received_transactions :: list(),
+                pending_updates :: dict:dict()}).
+
 
 %%%===================================================================
 %%% lasp_synchronization_backend callbacks
@@ -55,8 +59,12 @@
 %% state_based messages:
 extract_log_type_and_payload({state_ack, _From, _Id, {_Id, _Type, _Metadata, State}}) ->
     [{state_ack, State}];
+extract_log_type_and_payload({operations_ack, _From, _Blocked, _ID}) ->
+    [{operations_ack, _From, _Blocked, _ID}];
 extract_log_type_and_payload({state_send, _Node, {Id, Type, _Metadata, State}, _AckRequired}) ->
-    [{Id, State}, {Type, State}, {state_send, State}, {state_send_protocol, Id}].
+    [{Id, State}, {Type, State}, {state_send, State}, {state_send_protocol, Id}];
+extract_log_type_and_payload({operations_send, _Node, {Operations, CRDTActor, Blocked, ID}}) ->
+    [{operations_send, {Operations, CRDTActor, Blocked, ID}}].
 
 %%%===================================================================
 %%% API
@@ -69,6 +77,9 @@ start_link(Opts) ->
 
 blocking_sync(ObjectFilterFun) ->
     gen_server:call(?MODULE, {blocking_sync, ObjectFilterFun}, infinity).
+
+buffer_updates(Operations, Actor, ID) ->
+    gen_server:call(?MODULE, {buffer_updates, Operations, Actor, ID}, infinity).
 
 %%%===================================================================
 %%% gen_server callbacks
@@ -97,15 +108,48 @@ init([Store, Actor]) ->
     schedule_plumtree_peer_refresh(),
 
     BlockingSyncs = dict:new(),
+    PendingUpdates = dict:new(),
+    ReceivedTransactions = [],
 
     {ok, #state{gossip_peers=[],
                 blocking_syncs=BlockingSyncs,
+                pending_updates=PendingUpdates,
+                received_transactions=ReceivedTransactions,
                 store=Store,
                 actor=Actor}}.
 
 %% @private
 -spec handle_call(term(), {pid(), term()}, #state{}) ->
     {reply, term(), #state{}}.
+
+%% Buffer the updates `Operations`
+%% `ID` is the current transaction ID
+handle_call({buffer_updates, Operations, CRDTActor, ID}, From,
+             #state{gossip_peers=GossipPeers}=State) ->
+
+    %% Get the peers to synchronize with.
+    Members = case ?SYNC_BACKEND:broadcast_tree_mode() of
+        true ->
+            GossipPeers;
+        false ->
+            {ok, Members1} = ?SYNC_BACKEND:membership(),
+            Members1
+    end,
+
+    %% Remove ourself and compute exchange peers.
+    Peers = ?SYNC_BACKEND:compute_exchange(?SYNC_BACKEND:without_me(Members)),
+
+
+    %% Add the operations for each known peer
+    %% The structure of pending updates is
+    %% {[List of operations], Actor, Blocked-node, Transaction-ID}
+    %% Where an operation is = {ObjectID, Operation}
+    PendingUpdates = {[{Operations, Peer} || Peer <- Peers], CRDTActor, From, ID},
+
+    self() ! {buffer_sync},
+
+    {noreply, State#state{pending_updates=PendingUpdates}};
+
 
 handle_call({blocking_sync, ObjectFilterFun}, From,
             #state{gossip_peers=GossipPeers,
@@ -148,6 +192,33 @@ handle_call(Msg, _From, State) ->
 
 -spec handle_cast(term(), #state{}) -> {noreply, #state{}}.
 
+%% Ack from `From` that it has performed the transaction `ÌD`
+handle_cast({operations_ack, From, Blocked, ID},
+            #state{pending_updates={PendingUpdates0, CRDTActor, Blocked, UID}}=State) ->
+
+    % At most one delivery
+    PendingUpdates = case UID=:=ID of
+        true ->
+            lists:filter(fun ({_, Peer}) ->
+                                 Peer =/= From
+                         end, PendingUpdates0);
+        false ->
+            PendingUpdates0
+        end,
+
+    case length(PendingUpdates) == 0 of
+        % The transaction is done
+        true ->
+            nothing;
+        %% Smoother, but sends two ok to the `Blocked `node
+            % gen_server:reply(Blocked, ok);
+        false ->
+            nothing
+    end,
+
+    {noreply, State#state{pending_updates={PendingUpdates, CRDTActor, Blocked, UID}}};
+
+
 handle_cast({state_ack, From, Id, {Id, _Type, _Metadata, Value}},
             #state{store=Store,
                    blocking_syncs=BlockingSyncs0}=State) ->
@@ -172,6 +243,38 @@ handle_cast({state_ack, From, Id, {Id, _Type, _Metadata, Value}},
                 end
               end, dict:new(), BlockingSyncs0),
     {noreply, State#state{blocking_syncs=BlockingSyncs}};
+
+%% Receives the `Operations` of transaction `ID` to Perform
+%% Performs them locally and add `ID` to the set of applied transaction `ReceivedTransactions`
+handle_cast({operations_send, From, {Operations, CRDTActor, Blocked, ID}},
+                #state{store=Store, actor=Actor, received_transactions=ReceivedTransactions0}=State) ->
+        lasp_marathon_simulations:log_message_queue_size("operations_send"),
+
+        % At most one message delivery
+        ReceivedTransactions = case lists:any(fun(Elem) ->
+                                             Elem =:= ID
+                                         end, ReceivedTransactions0) of
+                        true ->
+                            ReceivedTransactions0;
+                        false ->
+                            %% Haven't receive these operations yet
+                            %% Apply all operations locally
+                            lists:foreach(fun(Operation) ->
+                                {Id, Change} = Operation,
+                                Result0 = ?CORE:update(Id, Change, CRDTActor, ?CLOCK_INCR(Actor),
+                                                        ?CLOCK_INIT(Actor), Store),
+                                lasp_distribution_backend:declare_if_not_found(
+                                    Result0, Id, State, ?CORE, update,
+                                    [Id, Operation, Actor, ?CLOCK_INCR(Actor), Store])
+                            end, Operations),
+
+                            %% Append the ID of the transaction to the received ones
+                            lists:append(ReceivedTransactions0, [ID])
+                        end,
+        %% Send ack
+        ?SYNC_BACKEND:send(?MODULE, {operations_ack, node(), Blocked, ID}, From),
+
+        {noreply, State#state{received_transactions=ReceivedTransactions}};
 
 handle_cast({state_send, From, {Id, Type, _Metadata, Value}, AckRequired},
             #state{store=Store, actor=Actor}=State) ->
@@ -251,6 +354,45 @@ handle_info({state_sync, ObjectFilterFun},
 
     {noreply, State};
 
+handle_info({buffer_sync},
+            #state{pending_updates={PendingUpdates, CRDTActor, Blocked, ID}, gossip_peers=GossipPeers} = State) ->
+
+    lasp_marathon_simulations:log_message_queue_size("buffer_sync"),
+
+    Members = case ?SYNC_BACKEND:broadcast_tree_mode() of
+        true ->
+            GossipPeers;
+        false ->
+            {ok, Members1} = ?SYNC_BACKEND:membership(),
+            Members1
+    end,
+
+    %% Remove ourself and compute exchange peers.
+    Peers = ?SYNC_BACKEND:compute_exchange(?SYNC_BACKEND:without_me(Members)),
+
+    %% Send buffered op to all peers
+    SyncFun = fun(Peer) ->
+                case lists:keyfind(Peer, 2, PendingUpdates) of
+                    {Operations, Peer} ->
+                        ?SYNC_BACKEND:send(?MODULE, {operations_send, node(),
+                                {Operations, CRDTActor, Blocked, ID}}, Peer);
+                    false ->
+                        nothing
+                end
+              end,
+    lists:foreach(SyncFun, Peers),
+
+    %% Schedule next synchronization.
+    case length(PendingUpdates) == 0 of
+        true ->
+            %% Unlock the blocked node (all nodes have done the transaction)
+            gen_server:reply(Blocked, ok);
+        false ->
+            schedule_buffer_synchronization()
+    end,
+
+    {noreply, State};
+
 handle_info(plumtree_peer_refresh, State) ->
     %% TODO: Temporary hack until the Plumtree can propagate tree
     %% information in the metadata messages.  Therefore, manually poll
@@ -290,8 +432,47 @@ code_change(_OldVsn, State, _Extra) ->
 %%%===================================================================
 
 %% @private
+schedule_buffer_synchronization() ->
+    ShouldSync = true
+            andalso ?SYNC_BACKEND:should_sync(true) %% New!
+            andalso (not ?SYNC_BACKEND:tutorial_mode())
+            andalso (
+              ?SYNC_BACKEND:peer_to_peer_mode()
+              orelse
+              (
+               ?SYNC_BACKEND:client_server_mode()
+               andalso
+               not (?SYNC_BACKEND:i_am_server() andalso ?SYNC_BACKEND:reactive_server())
+              )
+            ),
+
+    case ShouldSync of
+        true ->
+            Interval = lasp_config:get(state_interval, 10000),
+            case lasp_config:get(jitter, false) of
+                true ->
+                    %% Add random jitter.
+                    MinimalInterval = round(Interval * 0.10),
+
+                    case MinimalInterval of
+                        0 ->
+                            %% No jitter.
+                            timer:send_after(Interval, {buffer_sync});
+                        JitterInterval ->
+                            Jitter = rand_compat:uniform(JitterInterval * 2) - JitterInterval,
+                            timer:send_after(Interval + Jitter, {buffer_sync})
+                    end;
+                false ->
+                    timer:send_after(Interval, {buffer_sync})
+            end;
+        false ->
+            ok
+    end.
+
+%% @private
 schedule_state_synchronization() ->
     ShouldSync = true
+            andalso ?SYNC_BACKEND:should_sync(false) %% New!
             andalso (not ?SYNC_BACKEND:tutorial_mode())
             andalso (
               ?SYNC_BACKEND:peer_to_peer_mode()

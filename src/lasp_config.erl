@@ -62,6 +62,7 @@ web_config() ->
     lager:info("Node ~p enabling web configuration: ~p", [Node, Config]),
     Config.
 
+
 %% @private
 peer_service_manager() ->
     partisan_config:get(partisan_peer_service_manager,

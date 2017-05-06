@@ -34,6 +34,7 @@
          declare/2,
          declare_dynamic/2,
          update/3,
+         transaction/2,
          bind/2,
          bind_to/2,
          read/2,
@@ -126,7 +127,19 @@ declare(Id, Type) ->
 %%
 -spec update(id(), operation(), actor()) -> {ok, var()} | {error, timeout}.
 update(Id, Operation, Actor) ->
-    do(update, [Id, Operation, Actor]).
+    ct:pal("Update!"), %% Needed for the tests but weird
+    {ok, Res} = do(transaction, [[{Id, Operation}], Actor]),
+    {ok, hd(Res)}.
+    % do(update, [Id, Operation, Actor]).
+
+%% @doc Performs atomically multiple operations.
+%%
+%%      Performs the corresponding operation for each element of `Operations'.
+%%
+-spec transaction(list(), actor()) -> {ok, list()} | {error, timeout}.
+transaction(Operations, Actor) ->
+    do(transaction, [Operations, Actor]).
+
 
 %% @doc Bind a dataflow variable to a value.
 %%

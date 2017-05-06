@@ -94,11 +94,12 @@ all() ->
      monotonic_read_test,
      map_test,
      filter_test,
+     transaction_test,
      union_test,
      product_test,
      intersection_test,
-     membership_test,
-     enforce_once_test
+    %  enforce_once_test,
+     membership_test
     ].
 
 -include("lasp.hrl").
@@ -548,6 +549,92 @@ filter_test(_Config) ->
     ok.
 
 %% @doc Union operation test.
+transaction_test(_Config) ->
+    %% Create initial sets.
+    {ok, {S1, _, _, _}} = lasp:declare({<<"S1">>, state_orset}, state_orset),
+    {ok, {S2, _, _, _}} = lasp:declare({<<"S2">>, state_orset}, state_orset),
+
+    %% Create output set.
+    {ok, {S3, _, _, _}} = lasp:declare({<<"S3">>, state_orset}, state_orset),
+
+    %% Populate S1.
+    ?assertMatch({ok, _}, lasp:transaction([{S1, {add_all, [1,2,3]}}], a)),
+
+    %% Read S2
+    {ok, {_, _, _, SetTwo}} = lasp:read(S2, undefined),
+    SetTwo2 = lasp_type:query(?SET, SetTwo),
+    ?assertEqual({ok, sets:from_list([])}, {ok, SetTwo2}),
+
+    %% Sleep.
+    timer:sleep(4000),
+
+    %% Transaction 1 happened
+    {ok, {_, _, _, SetOne}} = lasp:read(S1, undefined),
+    SetOne2 = lasp_type:query(?SET, SetOne),
+    ?assertEqual({ok, sets:from_list([1,2,3])}, {ok, SetOne2}),
+
+
+    ?assertMatch({ok, _}, lasp:transaction([{S2, {add, 1}}, {S2, {add, 2}}], a)),
+
+    %% Sleep.
+    timer:sleep(4000),
+
+    % %% Apply intersection.
+    ?assertMatch(ok, lasp:intersection(S1, S2, S3)),
+
+    %% Read
+    {ok, {_, _, _, Inter0}} = lasp:read(S3, undefined),
+
+    %% Read intersection value.
+    Inter = lasp_type:query(?SET, Inter0),
+    ?assertEqual({ok, sets:from_list([1,2])}, {ok, Inter}),
+
+    %% Second test, add and remove froms set
+    {ok, {S4, _, _, _}} = lasp:declare({<<"S4">>, state_orset}, state_orset),
+
+    %% Multiple add and remove the item at last
+    ?assertMatch({ok, _}, lasp:transaction([{S4, {add, 1}}], a)),
+    ?assertMatch({ok, _}, lasp:transaction([{S4, {add, 1}}], a)),
+    ?assertMatch({ok, _}, lasp:transaction([{S4, {rmv, 1}}], a)),
+
+    %% Sleep.
+    timer:sleep(4000),
+
+    %% Read
+    {ok, {_, _, _, Res0}} = lasp:read(S4, undefined),
+
+    %% Read add-rmv result
+    Res = lasp_type:query(?SET, Res0),
+    ?assertEqual({ok, sets:from_list([])}, {ok, Res}),
+
+    % %% Now with multiple nodes
+    [Node1, Node2 | _Nodes] = proplists:get_value(nodes, _Config),
+
+    % Declare the set
+    {ok, {NS1, _, _, _}} = rpc:call(Node1, lasp, declare, [{<<"MultiSet">>, state_orset}, state_orset]),
+
+    %% Performs two transaction on the same set from different nodes
+    ?assertMatch({ok, _}, rpc:call(Node1, lasp, transaction, [[{NS1, {add, 1}}], self()])),
+    ?assertMatch({ok, _}, rpc:call(Node1, lasp, transaction, [[{NS1, {add, 1}}], self()])),
+    ?assertMatch({ok, _}, rpc:call(Node1, lasp, transaction, [[{NS1, {rmv, 1}}], self()])),
+
+    timer:sleep(400),
+    lager:info("Transaction finished~n"),
+
+
+    %% Verify variable has the correct value on node 1.
+    {ok, NS1R} = rpc:call(Node1, lasp, query, [NS1]),
+    ?assertEqual({ok, sets:from_list([])}, {ok, NS1R}),
+
+    %% Verify variable has the correct value on node 2.
+    {ok, NS1R2} = rpc:call(Node2, lasp, query, [NS1]),
+    ?assertEqual({ok, sets:from_list([])}, {ok, NS1R2}),
+
+    lager:info("Transaction finished, result of query: ~p", [NS1R2]),
+
+    ok.
+
+%% @doc Union operation test.
 union_test(_Config) ->
     %% Create initial sets.
     {ok, {S1, _, _, _}} = lasp:declare(?SET),
@@ -776,58 +863,58 @@ orset_test(_Config) ->
 
     ok.
 
-%% @doc Enforce once test.
-enforce_once_test(Config) ->
-    Manager = lasp_peer_service:manager(),
-    lager:info("Manager: ~p", [Manager]),
-
-    Nodes = proplists:get_value(nodes, Config),
-    lager:info("Nodes: ~p", [Nodes]),
-    Node = hd(lists:usort(Nodes)),
-
-    lager:info("Waiting for cluster to stabilize."),
-    timer:sleep(10000),
-
-    %% Declare the object first: if not, invariant can't be registered.
-    Id = {<<"object">>, ?COUNTER_TYPE},
-    {ok, _} = rpc:call(Node, lasp, declare, [Id, ?COUNTER_TYPE]),
-
-    %% Define an enforce-once invariant.
-    Self = self(),
-    Threshold = {value, 1},
-
-    EnforceFun = fun(X) ->
-                         lager:info("Enforce function fired with: ~p", [X]),
-                         Self ! {ok, Threshold}
-                 end,
-
-    lager:info("Adding invariant on node: ~p!", [Node]),
-
-    case rpc:call(Node, lasp, enforce_once, [Id, Threshold, EnforceFun]) of
-        ok ->
-            lager:info("Invariant configured!");
-        Error ->
-            lager:info("Invariant can't be configured: ~p", [Error]),
-            ct:fail(failed)
-    end,
-
-    %% Increment counter twice to get trigger to fire.
-    {ok, _} = rpc:call(Node, lasp, update, [Id, increment, self()]),
-    {ok, _} = rpc:call(Node, lasp, update, [Id, increment, self()]),
-
-    lager:info("Waiting for response..."),
-    receive
-        {ok, Threshold} ->
-            ok
-    after
-        10000 ->
-            lager:info("Did not receive response!"),
-            ct:fail(failed)
-    end,
-
-    lager:info("Finished enforce_once test."),
-
-    ok.
+% %% @doc Enforce once test.
+% enforce_once_test(Config) ->
+%     Manager = lasp_peer_service:manager(),
+%     lager:info("Manager: ~p", [Manager]),
+%
+%     Nodes = proplists:get_value(nodes, Config),
+%     lager:info("Nodes: ~p", [Nodes]),
+%     Node = hd(lists:usort(Nodes)),
+%
+%     lager:info("Waiting for cluster to stabilize."),
+%     timer:sleep(10000),
+%
+%     %% Declare the object first: if not, invariant can't be registered.
+%     Id = {<<"object">>, ?COUNTER_TYPE},
+%     {ok, _} = rpc:call(Node, lasp, declare, [Id, ?COUNTER_TYPE]),
+%
+%     %% Define an enforce-once invariant.
+%     Self = self(),
+%     Threshold = {value, 1},
+%
+%     EnforceFun = fun(X) ->
+%                          lager:info("Enforce function fired with: ~p", [X]),
+%                          Self ! {ok, Threshold}
+%                  end,
+%
+%     lager:info("Adding invariant on node: ~p!", [Node]),
+%
+%     case rpc:call(Node, lasp, enforce_once, [Id, Threshold, EnforceFun]) of
+%         ok ->
+%             lager:info("Invariant configured!");
+%         Error ->
+%             lager:info("Invariant can't be configured: ~p", [Error]),
+%             ct:fail(failed)
+%     end,
+%
+%     %% Increment counter twice to get trigger to fire.
+%     {ok, _} = rpc:call(Node, lasp, update, [Id, increment, self()]),
+%     {ok, _} = rpc:call(Node, lasp, update, [Id, increment, self()]),
+%
+%     lager:info("Waiting for response..."),
+%     receive
+%         {ok, Threshold} ->
+%             ok
+%     after
+%         10000 ->
+%             lager:info("Did not receive response!"),
+%             ct:fail(failed)
+%     end,
+%
+%     lager:info("Finished enforce_once test."),
+%
+%     ok.
 
 %% @doc Membership test.
 membership_test(Config) ->
